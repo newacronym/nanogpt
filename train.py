@@ -35,10 +35,15 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # attention (materializes the large (T,T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2,-1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) * (B, nh, T, hs) -> (B, nh, T, hs)
+        # att = (q @ k.transpose(-2,-1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, T) * (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # We replace the above 4 lines of code, with Flash attention for faster computation
+        y = F.scaled_dot_product_attention(q, k, v, is_casual=True)
+
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all heads outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -196,6 +201,9 @@ if torch.cuda.is_available():
     device = "cuda"
 print(f"using device: {device}")
 
+# using TF32
+torch.set_float32_matmul_precision('high')
+
 
 # get a data batch
 import tiktoken
@@ -237,8 +245,9 @@ train_loader = DataLoaderLite(B=16, T=1024)
 
 # get logits
 # model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304)) # we are making vocab_size to the nearest power of 2 because of efficient computing
 model.to(device)
+model = torch.compile(model)
 
 # optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
@@ -247,7 +256,8 @@ for i in range(50):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
     torch.cuda.synchronize()
