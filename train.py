@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import math
+import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -232,7 +233,7 @@ torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
 
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=16, T=1024)
 
 # get logits
 # model = GPT.from_pretrained('gpt2')
@@ -242,16 +243,19 @@ model.to(device)
 # optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss:{loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference in ms
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}, loss:{loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec}")
 
-
-print(loss)
 import sys
 sys.exit(0)
 
