@@ -248,7 +248,9 @@ class DataLoaderLite:
         assert len(shards) > 0, f"no shards found for the split {split}"
         if master_process:
             print(f"found {len(shards)} shards for split {split}")
+        self.reset()
 
+    def reset(self):
         # state init at shard 0
         # we are striding for each processes
         self.current_shard = 0
@@ -317,6 +319,7 @@ if master_process:
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
 # using TF32
 torch.set_float32_matmul_precision('high')
@@ -354,6 +357,62 @@ optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, 
 
 for step in range(max_steps):
     t0 = time.time()
+
+    # once in while evaluate our validation loss
+    if step % 100 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0
+            val_loss_steps = 0
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+
+    # once in a while we generate from the model (except step 0, which is just noise)
+    # this code works fine if we disable torch.compile
+    if step > 0 and step % 100 == 0 and False:
+        model.eval()
+        num_return_sequences = 4
+        max_length = 32
+        tokens = enc.encode("Hello, I'm a langugae model,")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42 + ddp_rank)
+        while xgen.size(1) < max_length:
+            # forward the model to get the logits
+            with torch.no_grad():
+                logits, loss = model(xgen) # (B, T, vocab_size)
+                # take the logits at the last position
+                logits = logits[:, -1, :] # (B, vocab_size)
+                # get the probabilities
+                probs = F.softmax(logits, dim=-1)
+                # do top-k sampling
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                # select a token from top-k probabilities
+                ix = torch.mulinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+                # gather the corresponding indices
+                xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+                # append to the sequence
+                xgen = torch.cat((xgen, xcol), dim=1)
+        # print the generated text
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].to_list()
+            decoded = enc.decoded(tokens)
+            print(f"rank {ddp_rank} sample {i}: {decoded}")
+
+    # training loop
+    model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
@@ -392,40 +451,3 @@ for step in range(max_steps):
 
 if ddp:
     destroy_process_group()
-
-import sys
-sys.exit(0)
-
-
-model.eval()
-num_return_sequences = 5
-max_length = 30
-model.to(device)
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    # forward the model to get the logits
-    with torch.no_grad():
-        logits = model(x) # (B, T, vocab_size)
-
-        # take the logits at the last postion
-        logits = logits[:, -1, :] # (B, vocab_size)
-        # get the probabilities
-        probs = F.softmax(logits, dim=-1)
-        # take top50 probabilities
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # select a token from top-k probs
-        ix = torch.multinomial(topk_probs, 1) # (B, 1)
-        # gather the correspoding indices
-        xcol = torch.gather(topk_indices, -1, ix) #(B, 1)
-        # append to the sequences
-        x = torch.cat((x, xcol), dim=1)
-
-# print the generated text
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
-
-
-    
