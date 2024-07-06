@@ -4,9 +4,9 @@ To create a dataset using Fineweb
 ``` python fineweb.py ```
 
 For training
---nproc_per_node is the number of GPUs you want to train on 
+--nproc_per_node is the number of GPUs you want to train on <br/>
 ``` torchrun --standalone --nproc_per_node=8 train.py ``` <br/>
-or
+or <br/>
 ``` python3 -m torch.distributed.run --standalone --nproc_per_node=8 train.py ```
 
 
