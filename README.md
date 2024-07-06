@@ -1,6 +1,6 @@
 # nanogpt
 
-To create a dataset using Fineweb  <br/>
+Extracting and sharding the dataset  <br/>
 ``` python fineweb.py ```
 
 **For training** <br/>
