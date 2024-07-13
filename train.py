@@ -339,12 +339,9 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 # Gradient Simulation -> accumulating batches
-# total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-# B = 16 # micro batch size
-# T = 1024 # sequence length
-total_batch_size = 16384 # 2**19, ~0.5M, in number of tokens
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
 B = 16 # micro batch size
-T = 256 # sequence length
+T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
@@ -434,6 +431,7 @@ for step in range(max_steps):
                 # you might also want to add optimizer.state_dict() and
                 # rng seeds etc., if you wanted to more exactly resume training
                 torch.save(checkpoint, checkpoint_path)
+                print(f"Validation loss is {val_loss_accum.item()}, at {step} / {max_steps} step ")
 
     # once in a while evaluate hellaswag
     if (step % 250 == 0 or last_step) and (not use_compile):
