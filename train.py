@@ -20,7 +20,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INT = 1 # to offsetting the variance accumulated in residual network
+        self.c_proj.NANOGPT_SCALE_INIT = 1 # to offsetting the variance accumulated in residual network
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -44,7 +44,7 @@ class CausalSelfAttention(nn.Module):
         # y = att @ v # (B, nh, T, T) * (B, nh, T, hs) -> (B, nh, T, hs)
 
         # We replace the above 4 lines of code, with Flash attention for faster computation
-        y = F.scaled_dot_product_attention(q, k, v, is_casual=True)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all heads outputs side by side
@@ -59,7 +59,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate = 'tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INT = 1
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -214,7 +214,7 @@ class GPT(nn.Module):
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and 'cuda' in device
+        use_fused = fused_available and device_type == "cuda"
         print(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
@@ -386,7 +386,7 @@ def get_lr(it):
 
 # optimizer
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 # create the log directory will write checkpoints and logs
 log_dir = "log"
@@ -404,8 +404,8 @@ for step in range(max_steps):
         model.eval()
         val_loader.reset()
         with torch.no_grad():
-            val_loss_accum = 0
-            val_loss_steps = 0
+            val_loss_accum = 0.0
+            val_loss_steps = 20
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
@@ -431,6 +431,7 @@ for step in range(max_steps):
                 # you might also want to add optimizer.state_dict() and
                 # rng seeds etc., if you wanted to more exactly resume training
                 torch.save(checkpoint, checkpoint_path)
+                print(f"Validation loss is {val_loss_accum.item()}, at {step} / {max_steps} step ")
 
     # once in a while evaluate hellaswag
     if (step % 250 == 0 or last_step) and (not use_compile):
@@ -481,7 +482,7 @@ for step in range(max_steps):
         while xgen.size(1) < max_length:
             # forward the model to get the logits
             with torch.no_grad():
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
@@ -490,15 +491,15 @@ for step in range(max_steps):
                 # do top-k sampling
                 topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
                 # select a token from top-k probabilities
-                ix = torch.mulinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
                 # gather the corresponding indices
                 xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
                 # append to the sequence
                 xgen = torch.cat((xgen, xcol), dim=1)
         # print the generated text
         for i in range(num_return_sequences):
-            tokens = xgen[i, :max_length].to_list()
-            decoded = enc.decoded(tokens)
+            tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
             print(f"rank {ddp_rank} sample {i}: {decoded}")
 
     # training loop
@@ -508,7 +509,7 @@ for step in range(max_steps):
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         # we have to scale the loss to account to gradient accumulation,
         # as the gradients just add on each successive backward().
